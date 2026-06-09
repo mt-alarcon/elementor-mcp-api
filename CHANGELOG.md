@@ -3,6 +3,48 @@
 All notable changes to this fork of [bvisible/elementor-mcp-api](https://github.com/bvisible/elementor-mcp-api) are documented here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/); versions are the plugin header version.
 
+## [1.4.1] — 2026-06-09
+
+Independent security-audit follow-up, applied **before any production install**.
+Focuses on stored-XSS surface and capability hardening across both REST and MCP.
+
+### Security (MUST-FIX)
+- **SVG stored-XSS — fixed.** Removed `image/svg+xml` from the media-import allowlist
+  (now raster-only: jpg/png/gif/webp/avif). SVG is XML that can carry `<script>` and the
+  import does a raw `copy()` with no sanitization — it would execute on the site domain.
+  WordPress blocks SVG uploads by default for the same reason.
+- **Per-post capability checks (REST).** `edit`/`read` permission callbacks now check
+  `edit_post`/`read_post` on the **specific** page when the route carries an id (not the
+  blanket `edit_posts`), so one Author cannot rewrite or read another user's page/draft.
+  Page creation requires `edit_pages`.
+- **Per-post capability checks (MCP).** An Ability's `permission_callback` cannot see its
+  input, so every write/read ability now re-checks the resolved `post_id` *inside* its
+  `execute_callback` (`guard_edit_post` / `guard_read_post` → 403). This closes the MCP
+  door that fixing only REST would have left open.
+- **Site-global writes require `manage_options`.** `update_kit`, `create_template`, and the
+  `register_post_meta` auth callback for `_elementor_data` are administrator-only — they
+  are whole-site config, not per-page content. Abilities enforce the same via `guard_admin`.
+- **Raw-HTML gate.** The direct-meta fallback save (which bypasses Elementor's own save
+  pipeline and could persist inline `<script>`) now requires `unfiltered_html`.
+- **Documented Administrator-account requirement** in the README — create the Application
+  Password on a dedicated admin user.
+
+### Security / robustness (SHOULD)
+- **Draft leak — fixed.** `list_pages` / `list-pages` no longer return non-published pages
+  to callers who can't edit them; per-id reads check `read_post`.
+- **Field-name consistency.** `build_page` and `import_media` now accept both `source_path`
+  (canonical, matches the MCP ability) and the legacy `path`, so neither surface silently
+  imports nothing.
+- **Payload ceiling.** Write request bodies over ~4 MB are rejected (413) before JSON
+  decoding (`Validator::check_body_size`).
+- **Snapshot semantics documented.** Restore is one level deep and only valid until the next
+  write (two writes in a row destroy the good backup) — noted in README + IMPROVEMENTS.
+- `create_template` now validates its element tree (parity with the other writers).
+
+### Tests
+- 46/46 assertions (`php tests/run.php`): added SVG-rejection and payload-ceiling cases.
+  Capability/draft-leak checks call WordPress and are flagged for on-install validation.
+
 ## [1.4.0] — 2026-06-09
 
 First release of the `mt-alarcon` fork. Focus: hardening the plugin for unattended,

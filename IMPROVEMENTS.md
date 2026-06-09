@@ -103,11 +103,41 @@ uniform `error_response()`.
 `patch-elements-bulk`, `restore-page`, `get-kit-globals`; reused the Validator across write
 abilities.
 
-**`neoservice-elementor-api.php`** — loads Validator; `str_starts_with` polyfill; version → 1.4.0.
+**`neoservice-elementor-api.php`** — loads Validator; `str_starts_with` polyfill; version → 1.4.0
+(→ 1.4.1 in the audit follow-up, §3b).
 
-**`tests/`** — `run.php` + `wp-stubs.php` + 2 suites, 41 assertions, runs on bare PHP.
+**`tests/`** — `run.php` + `wp-stubs.php` + 2 suites, 41 assertions (→ 46 after §3b), runs on bare PHP.
 
 Verification done locally: `php -l` clean on all 10 PHP files; `php tests/run.php` → 41/41.
+
+---
+
+## 3b. v1.4.1 — independent security-audit follow-up (pre-production)
+
+A separate @vault audit found items to fix **before** the first production install. All
+applied; tests `php tests/run.php` → **46/46**.
+
+- **MUST-FIX-1 — SVG stored-XSS:** removed `image/svg+xml` from the import allowlist
+  (`Validator::resolve_media_path`, now raster-only). Test added.
+- **MUST-FIX-2 — capability hardening (REST + MCP + meta):**
+  - REST permission callbacks now do per-post `edit_post`/`read_post` when the route has an
+    id; create uses `edit_pages`; `build_page` enforces `edit_post` on a body `page_id`.
+  - MCP: per-post/admin guards (`guard_edit_post` / `guard_read_post` / `guard_admin`) called
+    **inside** each write/read `execute_callback`, because an Ability's permission callback
+    can't see input.
+  - `update_kit` / `create_template` / the `_elementor_data` meta auth → `manage_options`.
+  - Direct-meta fallback save gated on `unfiltered_html`.
+- **SHOULD-3 draft leak:** `list_pages` / `list-pages` skip non-published pages the caller
+  can't edit; per-id reads check `read_post`.
+- **SHOULD-4 field consistency:** `build_page` + `import_media` accept both `source_path`
+  (canonical) and legacy `path`.
+- **SHOULD-6 payload ceiling:** `Validator::check_body_size` (~4 MB → 413) wired into all
+  JSON-body REST writes. Test added.
+- **SHOULD-7:** snapshot/restore documented as one-level, valid-until-next-write.
+
+**Upstream-PR candidates (generic, not fork-specific) — alongside the v1.4.0 ones:** the
+SVG-XSS fix, the per-post + per-surface capability hardening, and the draft-leak fix are all
+generic security bugs in the upstream `bvisible/elementor-mcp-api` and should be offered back.
 
 ---
 
@@ -118,16 +148,24 @@ exercised without a real install and **must** be checked on the pilot site:
 
 1. **Save + restore round-trip** — write a page, confirm the backup meta is set, call
    `/page/{id}/restore`, confirm the page reverts and still opens cleanly in the Elementor editor.
+   Confirm restore is one-level (a second write destroys the good backup).
 2. **Tree validation in situ** — a deliberately malformed payload returns 400 (not a 500 /
    white screen); a valid payload still saves and renders.
-3. **Media path guard** — an in-uploads image imports; an out-of-uploads path and a `../`
-   path are rejected; content-hash dedup returns the same attachment on re-import.
+3. **Media path guard** — an in-uploads image imports; an out-of-uploads path, a `../` path,
+   and an SVG are rejected; content-hash dedup returns the same attachment on re-import.
 4. **`/kit/globals`** — returns the real Kit colors/fonts, and a widget using the resulting
    `__globals__` references renders with the global value (the single most important
    professional-quality check).
 5. **`/health`** — reachable unauthenticated and reports correct versions / active state.
-6. **MCP parity** — the four new abilities register and execute through the MCP Adapter.
+6. **MCP parity** — the new abilities register and execute through the MCP Adapter.
 7. **PHP 7.4** — confirm the polyfill path on an actual 7.4 runtime (CI matrix or a 7.4 box).
+8. **Capability matrix (v1.4.1 — cannot be unit-tested without WP):** as a non-admin Author,
+   confirm: (a) cannot `edit_post` another user's page via REST **or** MCP (403); (b) cannot
+   `update_kit` / `create_template` (403); (c) cannot read another's draft via reads or
+   `list_pages`; (d) the `unfiltered_html` gate blocks a `<script>`-bearing fallback save.
+   As an Administrator, confirm all of the above succeed. The `manage_options` gate on the
+   `_elementor_data` meta route and the per-surface 403s are runtime-only behaviours.
+9. **Payload ceiling** — a >4 MB write body returns 413 before any DB write.
 
 ---
 

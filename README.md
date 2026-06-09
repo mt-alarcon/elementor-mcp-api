@@ -27,7 +27,7 @@ Build, edit, and manage Elementor pages programmatically — designed to be used
 - WordPress 6.0+
 - PHP 7.4+
 - Elementor (free or Pro)
-- Authentication: WordPress Application Passwords (recommended) or cookie auth
+- Authentication: WordPress Application Passwords (recommended) or cookie auth, on an **Administrator** account (see [Security](#security))
 
 ## Installation
 
@@ -159,18 +159,22 @@ This copies the skill to `~/.claude/skills/elementor-builder/`. Restart Claude C
 - **Flush CSS**: Always call `/flush-css` after visual changes — Elementor caches CSS aggressively.
 - **Element IDs**: Always provide valid 8-character hex IDs when creating elements.
 - **PATCH merges settings**: Only send the settings you want to change, not the full settings object.
-- **Saves are snapshotted**: every write keeps a one-level backup of the prior `_elementor_data`. Undo a bad write with `POST /page/{id}/restore` (or the `restore-page` ability).
+- **Saves are snapshotted (single-level undo)**: every write keeps a backup of the prior `_elementor_data`. Undo a bad write with `POST /page/{id}/restore` (or the `restore-page` ability). The backup is **one level deep and only valid until the next write** — two writes in a row overwrite the good backup with the bad intermediate state, so restore immediately after the write you want to undo.
 
 ## Security
 
 This is a **write-capable API driven by AI agents**, so it ships with guard rails:
 
-- **Permissions** — reads require the `read` capability, writes require `edit_posts`. Authenticate with WordPress Application Passwords.
+- **Run under an Administrator account.** This API touches site-global config (the Kit, theme-builder templates, raw `_elementor_data` meta) and writes element JSON that can contain inline HTML. Those operations require `manage_options` / `unfiltered_html`, which only administrators hold. Create the Application Password on a **dedicated administrator user** for the integration. (A lower role can still drive per-page edits it owns, but Kit/template/global writes will be refused.)
+- **Tiered permissions:**
+  - Reads require `read`; per-page reads additionally check `read_post` so drafts/private pages a caller can't see are not leaked.
+  - Per-page writes check `edit_post` on the **specific** page (not the blanket `edit_posts`), so one author can't rewrite another's page. Creating pages requires `edit_pages`.
+  - **Site-global writes — `update_kit`, `create_template`, and the raw `_elementor_data` meta route — require `manage_options`.** The MCP twins enforce the same checks *inside* each ability (an Ability's permission callback can't see its input), so the MCP door is closed alongside REST.
+  - The raw-meta fallback save is gated on `unfiltered_html` to block stored-XSS injection of `<script>` through that path.
 - **Tree validation** — every full-page write (`update_page`, `create_page`, `build_page`, `add_element` and their MCP twins) is structurally validated and bounded (max depth 30, max 5000 elements) before it touches the database. Malformed payloads are rejected with a clear error instead of bricking a page.
-- **Media path guard** — media import resolves and confirms the source path is inside the WordPress uploads directory and is a real image. Path traversal (`../`), absolute paths outside uploads, remote URLs, and non-image MIME types are rejected. Stage assets in the uploads directory before importing.
+- **Payload ceiling** — write request bodies above ~4 MB are rejected before JSON decoding.
+- **Media path guard** — media import resolves and confirms the source path is inside the WordPress uploads directory and is a real **raster** image. Path traversal (`../`), absolute paths outside uploads, remote URLs, **SVG** (XML/script XSS vector — blocked, as WordPress does by default), and non-image MIME types are rejected. Stage assets in the uploads directory before importing.
 - **Element-id validation** — element ids arriving in request bodies are validated (URL routes were already pattern-constrained).
-
-Keep credentials least-privileged: a dedicated editor account is preferable to an administrator.
 
 ## Testing
 
