@@ -70,6 +70,13 @@ return function (Asserter $t): void {
     $r = Validator::validate_tree($many);
     $t->true(is_wp_error($r) && $r->get_error_code() === 'tree_too_large', 'oversized tree rejected');
 
+    // ── check_body_size (payload ceiling, SHOULD #6) ─────────
+    $t->true(Validator::check_body_size('') === true, 'empty body within limit');
+    $t->true(Validator::check_body_size(str_repeat('x', 1024)) === true, '1KB body within limit');
+    $t->true(Validator::check_body_size(str_repeat('x', Validator::MAX_BODY_BYTES)) === true, 'body at exact limit accepted');
+    $r = Validator::check_body_size(str_repeat('x', Validator::MAX_BODY_BYTES + 1));
+    $t->true(is_wp_error($r) && $r->get_error_code() === 'payload_too_large', 'over-limit body rejected');
+
     // ── is_valid_element_id ──────────────────────────────────
     $t->true(Validator::is_valid_element_id('f8703b57'), 'hex id accepted');
     $t->true(Validator::is_valid_element_id('ABC123'), 'mixed-case alnum id accepted');

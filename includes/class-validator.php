@@ -22,8 +22,29 @@ class Validator {
     /** Maximum total number of elements in a single tree (DoS guard). */
     const MAX_ELEMENTS = 5000;
 
+    /** Maximum raw write-request body size in bytes (DoS guard, ~4 MB). */
+    const MAX_BODY_BYTES = 4194304;
+
     /** Allowed top-level element types. */
     const ALLOWED_ELTYPES = ['container', 'section', 'column', 'widget'];
+
+    /**
+     * Reject an oversized raw request body before it is JSON-decoded (a malicious or
+     * runaway payload should not be parsed into memory at all).
+     *
+     * @param string $raw_body The raw request body.
+     * @return true|\WP_Error
+     */
+    public static function check_body_size(string $raw_body) {
+        if (strlen($raw_body) > self::MAX_BODY_BYTES) {
+            return new \WP_Error(
+                'payload_too_large',
+                sprintf('Request body exceeds the %d-byte limit.', self::MAX_BODY_BYTES),
+                ['status' => 413]
+            );
+        }
+        return true;
+    }
 
     /**
      * Validate an Elementor element tree (the array stored in `_elementor_data`).
