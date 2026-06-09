@@ -31,13 +31,25 @@ class Elementor_Data {
         return is_array($data) ? $data : null;
     }
 
+    /** Post-meta key holding the previous `_elementor_data` for one-step rollback. */
+    const BACKUP_META_KEY = '_neoservice_elementor_backup';
+
     /**
      * Save Elementor data for a page.
      * Tries native Elementor save first, falls back to direct meta write.
      *
+     * Before overwriting, the current `_elementor_data` is snapshotted to
+     * {@see BACKUP_META_KEY} so a bad write can be reverted with {@see restore_backup}.
+     *
      * @return bool Success.
      */
     public static function save_page_data(int $post_id, array $data): bool {
+        // Snapshot the current state for rollback (best-effort, never blocks the save).
+        $previous = get_post_meta($post_id, '_elementor_data', true);
+        if (!empty($previous)) {
+            update_post_meta($post_id, self::BACKUP_META_KEY, $previous);
+        }
+
         // Ensure Elementor meta flags are set
         update_post_meta($post_id, '_elementor_edit_mode', 'builder');
         update_post_meta($post_id, '_elementor_template_type', 'wp-page');
@@ -61,6 +73,27 @@ class Elementor_Data {
         self::flush_css($post_id);
 
         return true;
+    }
+
+    /**
+     * Restore the previous `_elementor_data` snapshot taken by the last
+     * {@see save_page_data} call. One level deep — there is exactly one backup slot.
+     *
+     * @return bool True if a backup existed and was restored, false if none.
+     */
+    public static function restore_backup(int $post_id): bool {
+        $backup = get_post_meta($post_id, self::BACKUP_META_KEY, true);
+        if (empty($backup)) {
+            return false;
+        }
+
+        $decoded = is_string($backup) ? json_decode($backup, true) : $backup;
+        if (!is_array($decoded)) {
+            return false;
+        }
+
+        // Re-save through the normal path (which itself snapshots, enabling redo).
+        return self::save_page_data($post_id, $decoded);
     }
 
     /**
@@ -237,10 +270,63 @@ class Elementor_Data {
         return true;
     }
 
+    /**
+     * Get the design-system globals declared in the active Kit.
+     *
+     * Returns the global colors and fonts as a flat, agent-friendly map so the
+     * generation side can reference them via Elementor's `__globals__` mechanism
+     * (e.g. `globals/colors?id=primary`) instead of hardcoding inline hex — the
+     * single biggest lever for producing *professional*, brand-consistent pages.
+     *
+     * Shape:
+     *   {
+     *     "colors": [{"_id":"primary","title":"Primary","color":"#FF0000"}, ...],
+     *     "typography": [{"_id":"primary","title":"Primary","family":"Inter","weight":"600"}, ...]
+     *   }
+     */
+    public static function get_kit_globals(): array {
+        $settings = self::get_kit_settings();
+
+        $colors = [];
+        foreach (['system_colors', 'custom_colors'] as $bucket) {
+            if (!empty($settings[$bucket]) && is_array($settings[$bucket])) {
+                foreach ($settings[$bucket] as $c) {
+                    $colors[] = [
+                        '_id'   => $c['_id'] ?? '',
+                        'title' => $c['title'] ?? '',
+                        'color' => $c['color'] ?? '',
+                        'bucket' => $bucket === 'system_colors' ? 'system' : 'custom',
+                    ];
+                }
+            }
+        }
+
+        $typography = [];
+        foreach (['system_typography', 'custom_typography'] as $bucket) {
+            if (!empty($settings[$bucket]) && is_array($settings[$bucket])) {
+                foreach ($settings[$bucket] as $t) {
+                    $typography[] = [
+                        '_id'    => $t['_id'] ?? '',
+                        'title'  => $t['title'] ?? '',
+                        'family' => $t['typography_font_family'] ?? '',
+                        'weight' => $t['typography_font_weight'] ?? '',
+                        'bucket' => $bucket === 'system_typography' ? 'system' : 'custom',
+                    ];
+                }
+            }
+        }
+
+        return ['colors' => $colors, 'typography' => $typography];
+    }
+
     // ── Media ────────────────────────────────────────────────
 
     /**
      * Import an image from a file path into the WP media library.
+     *
+     * Dedup is keyed on the file's SHA-1 content hash (stored as attachment meta),
+     * not the title — two different images sharing a title must NOT collapse into one,
+     * and re-importing the identical file must be idempotent.
      */
     public static function import_image(string $source_path, string $title = ''): int {
         if (!file_exists($source_path)) return 0;
@@ -248,19 +334,23 @@ class Elementor_Data {
         $filename = basename($source_path);
         $title    = $title ?: pathinfo($filename, PATHINFO_FILENAME);
 
-        // Check if already imported
-        global $wpdb;
-        $existing = $wpdb->get_var($wpdb->prepare(
-            "SELECT ID FROM {$wpdb->posts} WHERE post_type='attachment' AND post_title=%s LIMIT 1",
-            $title
-        ));
-        if ($existing) return (int) $existing;
+        // Content-hash dedup: re-importing the same bytes returns the existing attachment.
+        $hash = @sha1_file($source_path);
+        if ($hash) {
+            global $wpdb;
+            $existing = $wpdb->get_var($wpdb->prepare(
+                "SELECT post_id FROM {$wpdb->postmeta} WHERE meta_key='_neoservice_source_hash' AND meta_value=%s LIMIT 1",
+                $hash
+            ));
+            if ($existing) return (int) $existing;
+        }
 
         $upload_dir = wp_upload_dir();
-        $dest = $upload_dir['path'] . '/' . $filename;
+        // Collision-safe destination filename inside the uploads dir.
+        $dest = $upload_dir['path'] . '/' . wp_unique_filename($upload_dir['path'], $filename);
 
-        if (!file_exists($dest)) {
-            copy($source_path, $dest);
+        if (!@copy($source_path, $dest)) {
+            return 0;
         }
 
         $filetype   = wp_check_filetype($filename);
@@ -274,6 +364,10 @@ class Elementor_Data {
         require_once ABSPATH . 'wp-admin/includes/image.php';
         $metadata = wp_generate_attachment_metadata($attach_id, $dest);
         wp_update_attachment_metadata($attach_id, $metadata);
+
+        if ($hash && $attach_id) {
+            update_post_meta($attach_id, '_neoservice_source_hash', $hash);
+        }
 
         return $attach_id;
     }

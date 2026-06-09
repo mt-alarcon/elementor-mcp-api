@@ -44,6 +44,14 @@ class REST_Controller {
             ...$editor,
         ]);
 
+        // Roll back the last save (restores the snapshot taken before the most
+        // recent write to this page). One level deep.
+        register_rest_route(self::NAMESPACE, '/page/(?P<id>\d+)/restore', [
+            'methods'  => 'POST',
+            'callback' => [$this, 'restore_page'],
+            ...$editor,
+        ]);
+
         // ── Elements (granular operations) ───────────────
         register_rest_route(self::NAMESPACE, '/page/(?P<id>\d+)/element', [
             'methods'  => 'POST',
@@ -139,6 +147,14 @@ class REST_Controller {
             ...$editor,
         ]);
 
+        // Design-system globals (colors + fonts) in an agent-friendly flat shape,
+        // ready to reference from widgets via `__globals__`.
+        register_rest_route(self::NAMESPACE, '/kit/globals', [
+            'methods'  => 'GET',
+            'callback' => [$this, 'get_kit_globals'],
+            ...$reader,
+        ]);
+
         // ── Widgets ──────────────────────────────────────
         register_rest_route(self::NAMESPACE, '/widgets', [
             'methods'  => 'GET',
@@ -178,6 +194,15 @@ class REST_Controller {
             'callback' => [$this, 'build_page'],
             ...$editor,
         ]);
+
+        // ── Health ────────────────────────────────────────
+        // Public, read-only probe. Lets a client confirm the plugin is installed and
+        // active (and which Elementor it sees) WITHOUT needing edit credentials.
+        register_rest_route(self::NAMESPACE, '/health', [
+            'methods'             => 'GET',
+            'callback'            => [$this, 'health'],
+            'permission_callback' => '__return_true',
+        ]);
     }
 
     // ── Permission checks ────────────────────────────────────
@@ -188,6 +213,19 @@ class REST_Controller {
 
     public function check_edit_permission(): bool {
         return current_user_can('edit_posts');
+    }
+
+    /**
+     * Convert a WP_Error (carrying an optional HTTP status in its data) into a
+     * uniform REST response: {"error": "<message>", "code": "<code>"}.
+     */
+    private function error_response(\WP_Error $error): \WP_REST_Response {
+        $data   = $error->get_error_data();
+        $status = is_array($data) && isset($data['status']) ? (int) $data['status'] : 400;
+        return new \WP_REST_Response([
+            'error' => $error->get_error_message(),
+            'code'  => $error->get_error_code(),
+        ], $status);
     }
 
     // ── Pages ────────────────────────────────────────────────
@@ -256,6 +294,11 @@ class REST_Controller {
             return new \WP_REST_Response(['error' => 'Missing or invalid "data" array'], 400);
         }
 
+        $valid = Validator::validate_tree($body['data']);
+        if (is_wp_error($valid)) {
+            return $this->error_response($valid);
+        }
+
         $success = Elementor_Data::save_page_data($id, $body['data']);
 
         return new \WP_REST_Response([
@@ -281,8 +324,12 @@ class REST_Controller {
             return new \WP_REST_Response(['error' => $post_id->get_error_message()], 500);
         }
 
-        // If Elementor data provided, save it
+        // If Elementor data provided, validate then save it
         if (!empty($body['data']) && is_array($body['data'])) {
+            $valid = Validator::validate_tree($body['data']);
+            if (is_wp_error($valid)) {
+                return $this->error_response($valid);
+            }
             Elementor_Data::save_page_data($post_id, $body['data']);
         }
 
@@ -291,6 +338,17 @@ class REST_Controller {
             'title' => $title,
             'url'   => get_permalink($post_id),
         ], 201);
+    }
+
+    public function restore_page(\WP_REST_Request $request): \WP_REST_Response {
+        $id = (int) $request['id'];
+
+        $restored = Elementor_Data::restore_backup($id);
+        if (!$restored) {
+            return new \WP_REST_Response(['error' => 'No backup available to restore'], 404);
+        }
+
+        return new \WP_REST_Response(['success' => true, 'id' => $id], 200);
     }
 
     // ── Elements ─────────────────────────────────────────────
@@ -327,8 +385,14 @@ class REST_Controller {
             return new \WP_REST_Response(['error' => 'Missing "element" object'], 400);
         }
 
-        // Ensure element has an ID
-        if (empty($element['id'])) {
+        // Validate the element subtree before insertion.
+        $valid = Validator::validate_tree([$element]);
+        if (is_wp_error($valid)) {
+            return $this->error_response($valid);
+        }
+
+        // Ensure element has a valid ID (generate one if missing or malformed).
+        if (empty($element['id']) || !Validator::is_valid_element_id($element['id'])) {
             $element['id'] = Element_Factory::generate_id();
         }
 
@@ -493,6 +557,10 @@ class REST_Controller {
             $settings = $patch['settings'] ?? [];
             if (!$eid || !is_array($settings)) {
                 $results[] = ['index' => $i, 'id' => $eid, 'status' => 'skipped', 'reason' => 'missing id or settings'];
+                continue;
+            }
+            if (!Validator::is_valid_element_id($eid)) {
+                $results[] = ['index' => $i, 'id' => $eid, 'status' => 'skipped', 'reason' => 'invalid element id'];
                 continue;
             }
             $ok = Elementor_Data::update_element_settings($data, $eid, $settings);
@@ -705,6 +773,10 @@ class REST_Controller {
         return new \WP_REST_Response(['success' => $success], $success ? 200 : 500);
     }
 
+    public function get_kit_globals(\WP_REST_Request $request): \WP_REST_Response {
+        return new \WP_REST_Response(Elementor_Data::get_kit_globals(), 200);
+    }
+
     // ── Widgets ──────────────────────────────────────────────
 
     public function list_widgets(\WP_REST_Request $request): \WP_REST_Response {
@@ -740,11 +812,14 @@ class REST_Controller {
         $path  = $body['path'] ?? '';
         $title = $body['title'] ?? '';
 
-        if (empty($path)) {
-            return new \WP_REST_Response(['error' => 'Missing "path"'], 400);
+        // Resolve + validate the path: must be a real image inside the uploads dir.
+        // Guards against path traversal / LFI on this write-capable endpoint.
+        $resolved = Validator::resolve_media_path((string) $path);
+        if (is_wp_error($resolved)) {
+            return $this->error_response($resolved);
         }
 
-        $attach_id = Elementor_Data::import_image($path, $title);
+        $attach_id = Elementor_Data::import_image($resolved, $title);
 
         if (!$attach_id) {
             return new \WP_REST_Response(['error' => "Failed to import: $path"], 500);
@@ -776,6 +851,14 @@ class REST_Controller {
     public function build_page(\WP_REST_Request $request): \WP_REST_Response {
         $body = $request->get_json_params();
 
+        // Validate the element tree up front (if provided) — fail before creating a page.
+        if (!empty($body['data']) && is_array($body['data'])) {
+            $valid = Validator::validate_tree($body['data']);
+            if (is_wp_error($valid)) {
+                return $this->error_response($valid);
+            }
+        }
+
         // Create or update page
         $page_id = $body['page_id'] ?? 0;
         if (!$page_id) {
@@ -790,11 +873,16 @@ class REST_Controller {
             }
         }
 
-        // Import images if provided
+        // Import images if provided (each path validated against traversal/LFI).
         $media_map = [];
         if (!empty($body['images']) && is_array($body['images'])) {
             foreach ($body['images'] as $key => $img) {
-                $attach_id = Elementor_Data::import_image($img['path'] ?? '', $img['title'] ?? '');
+                $resolved = Validator::resolve_media_path((string) ($img['path'] ?? ''));
+                if (is_wp_error($resolved)) {
+                    $media_map[$key] = ['id' => 0, 'url' => '', 'error' => $resolved->get_error_message()];
+                    continue;
+                }
+                $attach_id = Elementor_Data::import_image($resolved, $img['title'] ?? '');
                 $media_map[$key] = [
                     'id'  => $attach_id,
                     'url' => $attach_id ? wp_get_attachment_url($attach_id) : '',
@@ -813,5 +901,18 @@ class REST_Controller {
             'url'       => get_permalink($page_id),
             'media_map' => $media_map,
         ], 201);
+    }
+
+    // ── Health ───────────────────────────────────────────────
+
+    public function health(\WP_REST_Request $request): \WP_REST_Response {
+        return new \WP_REST_Response([
+            'ok'                => true,
+            'plugin'            => 'neoservice-elementor-api',
+            'plugin_version'    => defined('NEOSERVICE_ELEMENTOR_API_VERSION') ? NEOSERVICE_ELEMENTOR_API_VERSION : 'unknown',
+            'elementor_active'  => did_action('elementor/loaded') > 0,
+            'elementor_version' => defined('ELEMENTOR_VERSION') ? ELEMENTOR_VERSION : null,
+            'namespace'         => self::NAMESPACE,
+        ], 200);
     }
 }
