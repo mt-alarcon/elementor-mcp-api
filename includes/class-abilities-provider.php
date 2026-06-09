@@ -65,6 +65,7 @@ class Abilities_Provider {
     public static function register(): void {
         self::register_page_abilities();
         self::register_element_abilities();
+        self::register_bulk_abilities();
         self::register_template_abilities();
         self::register_kit_abilities();
         self::register_widget_abilities();
@@ -218,6 +219,11 @@ class Abilities_Provider {
             ],
             'execute_callback' => function ($input) {
                 $post_id = (int) $input['post_id'];
+                if (!is_array($input['data'])) {
+                    return new \WP_Error('invalid_data', 'data must be an array.');
+                }
+                $valid = Validator::validate_tree($input['data']);
+                if (is_wp_error($valid)) return $valid;
                 $success = Elementor_Data::save_page_data($post_id, $input['data']);
                 return ['success' => $success, 'post_id' => $post_id];
             },
@@ -270,6 +276,11 @@ class Abilities_Provider {
                 ]);
                 if (is_wp_error($post_id)) return $post_id;
                 if (!empty($input['data'])) {
+                    if (!is_array($input['data'])) {
+                        return new \WP_Error('invalid_data', 'data must be an array.');
+                    }
+                    $valid = Validator::validate_tree($input['data']);
+                    if (is_wp_error($valid)) return $valid;
                     Elementor_Data::save_page_data($post_id, $input['data']);
                 }
                 return ['post_id' => $post_id, 'url' => get_permalink($post_id)];
@@ -473,11 +484,22 @@ class Abilities_Provider {
                 }
 
                 $element  = $input['element'];
+                if (!is_array($element)) {
+                    return new \WP_Error('invalid_element', 'element must be an object.');
+                }
+                $valid = Validator::validate_tree([$element]);
+                if (is_wp_error($valid)) return $valid;
+                if (empty($element['id']) || !Validator::is_valid_element_id($element['id'])) {
+                    $element['id'] = Element_Factory::generate_id();
+                }
                 $position = (int) ($input['position'] ?? -1);
 
                 if (!empty($input['parent_id'])) {
                     $found = Elementor_Data::find_element($data, $input['parent_id']);
                     if (!$found) return new \WP_Error('not_found', 'Parent element not found.');
+                    if (!isset($found['element']['elements'])) {
+                        $found['element']['elements'] = [];
+                    }
                     Elementor_Data::insert_element($found['element']['elements'], $element, $position);
                 } else {
                     Elementor_Data::insert_element($data, $element, $position);
@@ -671,6 +693,141 @@ class Abilities_Provider {
         ]);
     }
 
+    // ── Bulk / discovery abilities (parity with REST 1.3+) ──
+
+    private static function register_bulk_abilities(): void {
+
+        wp_register_ability('neoservice/find-elements', [
+            'label'       => 'Find Elements',
+            'description' => 'Find elements on a page by widgetType, elType, or text contained in their settings. Returns each match with its id, type, depth, and parent_id. Use this to locate elements surgically before patching them.',
+            'category'    => 'neoservice-elementor',
+            'input_schema' => [
+                'type'       => 'object',
+                'required'   => ['post_id'],
+                'properties' => [
+                    'post_id'  => ['type' => 'integer', 'description' => 'The WordPress page/post ID.'],
+                    'widget'   => ['type' => 'string', 'description' => 'Match widgetType (e.g. "heading").'],
+                    'elType'   => ['type' => 'string', 'description' => 'Match elType (e.g. "container").'],
+                    'contains' => ['type' => 'string', 'description' => 'Match text contained in the element settings.'],
+                ],
+                'additionalProperties' => false,
+            ],
+            'output_schema' => ['type' => 'object'],
+            'execute_callback' => function ($input) {
+                $post_id = (int) $input['post_id'];
+                $widget  = $input['widget'] ?? null;
+                $eltype  = $input['elType'] ?? null;
+                $needle  = $input['contains'] ?? null;
+                if (!$widget && !$eltype && !$needle) {
+                    return new \WP_Error('missing_filter', 'Provide at least one of: widget, elType, contains.');
+                }
+                $data = Elementor_Data::get_page_data($post_id);
+                if (!$data) return new \WP_Error('not_found', 'Page not found.');
+
+                $matches = [];
+                $walk = function ($nodes, $parent_id = null, $depth = 0) use (&$walk, &$matches, $widget, $eltype, $needle) {
+                    foreach ($nodes as $node) {
+                        $match = true;
+                        if ($widget && ($node['widgetType'] ?? null) !== $widget) $match = false;
+                        if ($eltype && ($node['elType'] ?? null) !== $eltype) $match = false;
+                        if ($needle && stripos(json_encode($node['settings'] ?? []), $needle) === false) $match = false;
+                        if ($match) {
+                            $matches[] = [
+                                'id'         => $node['id'] ?? null,
+                                'widgetType' => $node['widgetType'] ?? null,
+                                'elType'     => $node['elType'] ?? null,
+                                'depth'      => $depth,
+                                'parent_id'  => $parent_id,
+                            ];
+                        }
+                        if (!empty($node['elements']) && is_array($node['elements'])) {
+                            $walk($node['elements'], $node['id'] ?? null, $depth + 1);
+                        }
+                    }
+                };
+                $walk($data);
+                return ['count' => count($matches), 'matches' => $matches];
+            },
+            'permission_callback' => [self::class, 'can_read'],
+            'meta' => self::meta_read(),
+        ]);
+
+        wp_register_ability('neoservice/patch-elements-bulk', [
+            'label'       => 'Patch Elements (Bulk)',
+            'description' => 'Apply many element settings patches in ONE page load/save cycle. Far more efficient and race-safe than issuing N update-element calls. Body: patches = [{id, settings}, ...]. Patches apply in order.',
+            'category'    => 'neoservice-elementor',
+            'input_schema' => [
+                'type'       => 'object',
+                'required'   => ['post_id', 'patches'],
+                'properties' => [
+                    'post_id' => ['type' => 'integer', 'description' => 'The WordPress page/post ID.'],
+                    'patches' => [
+                        'type'        => 'array',
+                        'description' => 'Array of {id, settings} objects.',
+                        'items'       => [
+                            'type'       => 'object',
+                            'properties' => [
+                                'id'       => ['type' => 'string'],
+                                'settings' => ['type' => 'object'],
+                            ],
+                        ],
+                    ],
+                ],
+                'additionalProperties' => false,
+            ],
+            'output_schema' => ['type' => 'object'],
+            'execute_callback' => function ($input) {
+                $post_id = (int) $input['post_id'];
+                $patches = $input['patches'] ?? [];
+                if (!is_array($patches) || empty($patches)) {
+                    return new \WP_Error('missing_patches', 'Missing "patches" array.');
+                }
+                $data = Elementor_Data::get_page_data($post_id);
+                if (!$data) return new \WP_Error('not_found', 'Page not found.');
+
+                $results = [];
+                foreach ($patches as $i => $patch) {
+                    $eid      = $patch['id'] ?? '';
+                    $settings = $patch['settings'] ?? [];
+                    if (!Validator::is_valid_element_id($eid) || !is_array($settings)) {
+                        $results[] = ['index' => $i, 'id' => $eid, 'status' => 'skipped'];
+                        continue;
+                    }
+                    $ok = Elementor_Data::update_element_settings($data, $eid, $settings);
+                    $results[] = ['index' => $i, 'id' => $eid, 'status' => $ok ? 'ok' : 'not_found'];
+                }
+                Elementor_Data::save_page_data($post_id, $data);
+                $ok_count = count(array_filter($results, fn($r) => $r['status'] === 'ok'));
+                return ['success' => true, 'applied' => $ok_count, 'total' => count($patches), 'results' => $results];
+            },
+            'permission_callback' => [self::class, 'can_edit'],
+            'meta' => self::meta_write(),
+        ]);
+
+        wp_register_ability('neoservice/restore-page', [
+            'label'       => 'Restore Page (Undo Last Save)',
+            'description' => 'Roll a page back to the snapshot taken immediately before its most recent save. One level deep. Use this to undo a bad write.',
+            'category'    => 'neoservice-elementor',
+            'input_schema' => [
+                'type'       => 'object',
+                'required'   => ['post_id'],
+                'properties' => [
+                    'post_id' => ['type' => 'integer', 'description' => 'The WordPress page/post ID.'],
+                ],
+                'additionalProperties' => false,
+            ],
+            'output_schema' => ['type' => 'object'],
+            'execute_callback' => function ($input) {
+                $post_id = (int) $input['post_id'];
+                $ok = Elementor_Data::restore_backup($post_id);
+                if (!$ok) return new \WP_Error('no_backup', 'No backup available to restore.');
+                return ['success' => true, 'post_id' => $post_id];
+            },
+            'permission_callback' => [self::class, 'can_edit'],
+            'meta' => self::meta_write(true),
+        ]);
+    }
+
     // ── Template Abilities ──────────────────────────────────
 
     private static function register_template_abilities(): void {
@@ -809,6 +966,18 @@ class Abilities_Provider {
             },
             'permission_callback' => [self::class, 'can_edit'],
             'meta' => self::meta_write(),
+        ]);
+
+        wp_register_ability('neoservice/get-kit-globals', [
+            'label'       => 'Get Design-System Globals',
+            'description' => 'Get the global colors and fonts from the active Kit in a flat, ready-to-reference shape. Use these IDs with a widget\'s __globals__ object (e.g. globals/colors?id=primary) to keep generated pages brand-consistent instead of hardcoding inline hex.',
+            'category'    => 'neoservice-elementor',
+            'output_schema' => ['type' => 'object'],
+            'execute_callback' => function () {
+                return Elementor_Data::get_kit_globals();
+            },
+            'permission_callback' => [self::class, 'can_read'],
+            'meta' => self::meta_read(),
         ]);
     }
 
@@ -951,12 +1120,21 @@ class Abilities_Provider {
                 ],
             ],
             'execute_callback' => function ($input) {
-                // Import images first
+                // Validate the element tree before doing any work.
+                if (empty($input['data']) || !is_array($input['data'])) {
+                    return new \WP_Error('invalid_data', 'data must be a non-empty array.');
+                }
+                $valid = Validator::validate_tree($input['data']);
+                if (is_wp_error($valid)) return $valid;
+
+                // Import images first (each path validated against traversal/LFI).
                 $image_ids = [];
                 if (!empty($input['images'])) {
                     foreach ($input['images'] as $img) {
-                        $id = Elementor_Data::import_image($img['source_path'], $img['title'] ?? '');
-                        if ($id) $image_ids[$img['title'] ?? basename($img['source_path'])] = $id;
+                        $resolved = Validator::resolve_media_path((string) ($img['source_path'] ?? ''));
+                        if (is_wp_error($resolved)) continue;
+                        $id = Elementor_Data::import_image($resolved, $img['title'] ?? '');
+                        if ($id) $image_ids[$img['title'] ?? basename($resolved)] = $id;
                     }
                 }
 
