@@ -168,13 +168,17 @@ class Validator {
             return new \WP_Error('not_a_file', 'Media path is not a regular file.', ['status' => 400]);
         }
 
-        // Only allow real image MIME types that WordPress recognises.
+        // Only allow real, RASTER image MIME types that WordPress recognises.
+        // SVG is intentionally excluded: it is XML that can carry <script>, and the
+        // import does a raw copy() with no sanitization → stored XSS on the site domain.
+        // WordPress blocks SVG uploads by default for the same reason. Do not re-enable
+        // without a dedicated safe-SVG sanitization library.
         $check = wp_check_filetype(basename($real_path));
-        $allowed = ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/svg+xml', 'image/avif'];
+        $allowed = ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/avif'];
         if (empty($check['type']) || !in_array($check['type'], $allowed, true)) {
             return new \WP_Error(
                 'unsupported_media_type',
-                'Only image files (jpg, png, gif, webp, svg, avif) can be imported.',
+                'Only raster image files (jpg, png, gif, webp, avif) can be imported. SVG is rejected (XSS risk).',
                 ['status' => 415]
             );
         }

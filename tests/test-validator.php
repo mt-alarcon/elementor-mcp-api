@@ -111,6 +111,13 @@ return function (Asserter $t): void {
     $res = Validator::resolve_media_path($php);
     $t->true(is_wp_error($res) && $res->get_error_code() === 'unsupported_media_type', 'non-image in uploads rejected');
 
+    // SVG rejected even inside uploads (XSS vector — MUST-FIX-1).
+    $svg = $uploads . '/icon.svg';
+    file_put_contents($svg, '<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>');
+    $res = Validator::resolve_media_path($svg);
+    $t->true(is_wp_error($res) && $res->get_error_code() === 'unsupported_media_type', 'SVG in uploads rejected (XSS)');
+    @unlink($svg);
+
     // missing path
     $res = Validator::resolve_media_path('');
     $t->true(is_wp_error($res) && $res->get_error_code() === 'missing_path', 'empty path rejected');
