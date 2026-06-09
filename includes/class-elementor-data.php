@@ -64,7 +64,16 @@ class Elementor_Data {
             }
         }
 
-        // Fallback: direct meta write
+        // Fallback: direct meta write. This path bypasses Elementor's own save
+        // pipeline, so the element JSON (which can contain inline HTML/scripts via
+        // widgets like text-editor or HTML) lands in post meta unsanitized. Gate it
+        // on the `unfiltered_html` capability — administrators have it; lower roles
+        // (e.g. Author) do not, which blocks stored-XSS injection through this route.
+        // When Elementor is active the native path above runs and this is never reached.
+        if (function_exists('current_user_can') && !current_user_can('unfiltered_html')) {
+            return false;
+        }
+
         $json = wp_slash(wp_json_encode($data));
         update_post_meta($post_id, '_elementor_data', $json);
         update_post_meta($post_id, '_elementor_version', ELEMENTOR_VERSION ?? '3.35.7');

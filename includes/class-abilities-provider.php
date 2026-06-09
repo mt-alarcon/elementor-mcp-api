@@ -43,10 +43,48 @@ class Abilities_Provider {
     }
 
     /**
-     * Permission: can edit posts.
+     * Permission: can edit posts (coarse gate used as the ability `permission_callback`).
+     *
+     * NOTE: an Ability's `permission_callback` does NOT receive the tool input, so it
+     * cannot do the per-post check. Each WRITE ability therefore re-checks the specific
+     * target inside its execute_callback via {@see guard_edit_post} once it knows the
+     * post_id. Without that, closing only the REST surface would leave the MCP door open.
      */
     public static function can_edit(): bool {
-        return current_user_can('edit_posts');
+        return current_user_can('edit_pages');
+    }
+
+    /**
+     * Per-post edit guard for use INSIDE a write ability's execute_callback.
+     * Returns a WP_Error (403) if the current user cannot edit this specific post,
+     * or null to proceed.
+     */
+    public static function guard_edit_post(int $post_id): ?\WP_Error {
+        if (!current_user_can('edit_post', $post_id)) {
+            return new \WP_Error('forbidden', 'You do not have permission to edit this post.', ['status' => 403]);
+        }
+        return null;
+    }
+
+    /**
+     * Per-post read guard for use INSIDE a read ability's execute_callback — blocks
+     * leaking a draft/private page the caller cannot read.
+     */
+    public static function guard_read_post(int $post_id): ?\WP_Error {
+        if (!current_user_can('read_post', $post_id)) {
+            return new \WP_Error('forbidden', 'You do not have permission to read this post.', ['status' => 403]);
+        }
+        return null;
+    }
+
+    /**
+     * Administrator guard for site-global config abilities (Kit, global templates).
+     */
+    public static function guard_admin(): ?\WP_Error {
+        if (!current_user_can('manage_options')) {
+            return new \WP_Error('forbidden', 'This action requires administrator capability.', ['status' => 403]);
+        }
+        return null;
     }
 
     /**
@@ -98,6 +136,10 @@ class Abilities_Provider {
                 $pages  = get_pages(['sort_column' => 'post_title']);
                 $result = [];
                 foreach ($pages as $page) {
+                    // Do not leak drafts/pending pages to a caller who cannot edit them.
+                    if ($page->post_status !== 'publish' && !current_user_can('edit_post', $page->ID)) {
+                        continue;
+                    }
                     $result[] = [
                         'id'            => $page->ID,
                         'title'         => $page->post_title,
@@ -138,6 +180,7 @@ class Abilities_Provider {
             ],
             'execute_callback' => function ($input) {
                 $post_id   = (int) $input['post_id'];
+                if ($e = self::guard_read_post($post_id)) return $e;
                 $structure = Elementor_Data::get_page_structure($post_id);
                 if (!$structure) {
                     return new \WP_Error('not_found', 'Page not found or has no Elementor data.');
@@ -177,6 +220,7 @@ class Abilities_Provider {
             ],
             'execute_callback' => function ($input) {
                 $post_id = (int) $input['post_id'];
+                if ($e = self::guard_read_post($post_id)) return $e;
                 $data    = Elementor_Data::get_page_data($post_id);
                 if (!$data) {
                     return new \WP_Error('not_found', 'Page not found or has no Elementor data.');
@@ -219,6 +263,7 @@ class Abilities_Provider {
             ],
             'execute_callback' => function ($input) {
                 $post_id = (int) $input['post_id'];
+                if ($e = self::guard_edit_post($post_id)) return $e;
                 if (!is_array($input['data'])) {
                     return new \WP_Error('invalid_data', 'data must be an array.');
                 }
@@ -319,6 +364,7 @@ class Abilities_Provider {
             ],
             'execute_callback' => function ($input) {
                 $post_id = (int) $input['post_id'];
+                if ($e = self::guard_read_post($post_id)) return $e;
                 $data    = Elementor_Data::get_page_data($post_id);
                 if (!$data) return new \WP_Error('not_found', 'Page not found.');
 
@@ -368,6 +414,7 @@ class Abilities_Provider {
             ],
             'execute_callback' => function ($input) {
                 $post_id = (int) $input['post_id'];
+                if ($e = self::guard_edit_post($post_id)) return $e;
                 $data    = Elementor_Data::get_page_data($post_id);
                 if (!$data) return new \WP_Error('not_found', 'Page not found.');
 
@@ -428,6 +475,7 @@ class Abilities_Provider {
             ],
             'execute_callback' => function ($input) {
                 $post_id = (int) $input['post_id'];
+                if ($e = self::guard_edit_post($post_id)) return $e;
                 $data    = Elementor_Data::get_page_data($post_id);
                 if (!$data) return new \WP_Error('not_found', 'Page not found.');
 
@@ -478,6 +526,7 @@ class Abilities_Provider {
             ],
             'execute_callback' => function ($input) {
                 $post_id = (int) $input['post_id'];
+                if ($e = self::guard_edit_post($post_id)) return $e;
                 $data    = Elementor_Data::get_page_data($post_id);
                 if (!$data) {
                     $data = [];
@@ -539,6 +588,7 @@ class Abilities_Provider {
             ],
             'execute_callback' => function ($input) {
                 $post_id = (int) $input['post_id'];
+                if ($e = self::guard_edit_post($post_id)) return $e;
                 $data    = Elementor_Data::get_page_data($post_id);
                 if (!$data) return new \WP_Error('not_found', 'Page not found.');
 
@@ -580,6 +630,7 @@ class Abilities_Provider {
             ],
             'execute_callback' => function ($input) {
                 $post_id = (int) $input['post_id'];
+                if ($e = self::guard_edit_post($post_id)) return $e;
                 $data    = Elementor_Data::get_page_data($post_id);
                 if (!$data) return new \WP_Error('not_found', 'Page not found.');
 
@@ -715,6 +766,7 @@ class Abilities_Provider {
             'output_schema' => ['type' => 'object'],
             'execute_callback' => function ($input) {
                 $post_id = (int) $input['post_id'];
+                if ($e = self::guard_read_post($post_id)) return $e;
                 $widget  = $input['widget'] ?? null;
                 $eltype  = $input['elType'] ?? null;
                 $needle  = $input['contains'] ?? null;
@@ -778,6 +830,7 @@ class Abilities_Provider {
             'output_schema' => ['type' => 'object'],
             'execute_callback' => function ($input) {
                 $post_id = (int) $input['post_id'];
+                if ($e = self::guard_edit_post($post_id)) return $e;
                 $patches = $input['patches'] ?? [];
                 if (!is_array($patches) || empty($patches)) {
                     return new \WP_Error('missing_patches', 'Missing "patches" array.');
@@ -819,6 +872,7 @@ class Abilities_Provider {
             'output_schema' => ['type' => 'object'],
             'execute_callback' => function ($input) {
                 $post_id = (int) $input['post_id'];
+                if ($e = self::guard_edit_post($post_id)) return $e;
                 $ok = Elementor_Data::restore_backup($post_id);
                 if (!$ok) return new \WP_Error('no_backup', 'No backup available to restore.');
                 return ['success' => true, 'post_id' => $post_id];
@@ -905,6 +959,11 @@ class Abilities_Provider {
                 ],
             ],
             'execute_callback' => function ($input) {
+                if ($e = self::guard_admin()) return $e;
+                if (!empty($input['data']) && is_array($input['data'])) {
+                    $valid = Validator::validate_tree($input['data']);
+                    if (is_wp_error($valid)) return $valid;
+                }
                 $conditions = $input['conditions'] ?? ['include/general'];
                 $post_id = Elementor_Data::create_template(
                     sanitize_text_field($input['title']),
@@ -960,6 +1019,7 @@ class Abilities_Provider {
                 ],
             ],
             'execute_callback' => function ($input) {
+                if ($e = self::guard_admin()) return $e;
                 $ok = Elementor_Data::update_kit_settings($input['settings']);
                 if (!$ok) return new \WP_Error('failed', 'Kit not found or update failed.');
                 return ['success' => true];
@@ -1120,6 +1180,12 @@ class Abilities_Provider {
                 ],
             ],
             'execute_callback' => function ($input) {
+                // If targeting an existing page, enforce per-post edit permission
+                // (the permission_callback only covers the create case via edit_pages).
+                if (!empty($input['post_id'])) {
+                    if ($e = self::guard_edit_post((int) $input['post_id'])) return $e;
+                }
+
                 // Validate the element tree before doing any work.
                 if (empty($input['data']) || !is_array($input['data'])) {
                     return new \WP_Error('invalid_data', 'data must be a non-empty array.');

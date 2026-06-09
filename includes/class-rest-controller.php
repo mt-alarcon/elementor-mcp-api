@@ -12,6 +12,8 @@ class REST_Controller {
     public function register_routes(): void {
         $editor = ['permission_callback' => [$this, 'check_edit_permission']];
         $reader = ['permission_callback' => [$this, 'check_read_permission']];
+        // Site-global config (Kit, global templates) — administrator only.
+        $admin  = ['permission_callback' => [$this, 'check_admin_permission']];
 
         // ── Pages ────────────────────────────────────────
         register_rest_route(self::NAMESPACE, '/pages', [
@@ -128,10 +130,12 @@ class REST_Controller {
             ...$reader,
         ]);
 
+        // Templates are theme-builder entities (headers/footers/global conditions)
+        // that affect the whole site — administrator only.
         register_rest_route(self::NAMESPACE, '/template', [
             'methods'  => 'POST',
             'callback' => [$this, 'create_template'],
-            ...$editor,
+            ...$admin,
         ]);
 
         // ── Kit / Global Settings ────────────────────────
@@ -141,10 +145,11 @@ class REST_Controller {
             ...$reader,
         ]);
 
+        // The Kit holds site-wide colors/typography/layout defaults — administrator only.
         register_rest_route(self::NAMESPACE, '/kit', [
             'methods'  => 'PUT',
             'callback' => [$this, 'update_kit'],
-            ...$editor,
+            ...$admin,
         ]);
 
         // Design-system globals (colors + fonts) in an agent-friendly flat shape,
@@ -207,18 +212,47 @@ class REST_Controller {
 
     // ── Permission checks ────────────────────────────────────
 
-    public function check_read_permission(): bool {
+    public function check_read_permission(\WP_REST_Request $request = null): bool {
+        // Per-post read check when an id is present (so drafts the caller can't
+        // read are not exposed); generic read otherwise.
+        if ($request && isset($request['id'])) {
+            return current_user_can('read_post', (int) $request['id']);
+        }
         return current_user_can('read');
     }
 
-    public function check_edit_permission(): bool {
-        return current_user_can('edit_posts');
+    public function check_edit_permission(\WP_REST_Request $request = null): bool {
+        // Per-post edit check when an id is present (maps to edit_page on the
+        // 'page' post type), so an Author cannot rewrite another user's page.
+        // For create routes (no id) require edit_pages — the broad edit_posts
+        // would let any contributor create site pages.
+        if ($request && isset($request['id'])) {
+            return current_user_can('edit_post', (int) $request['id']);
+        }
+        return current_user_can('edit_pages');
+    }
+
+    /**
+     * Site-global configuration (the Kit, global templates, raw `_elementor_data`
+     * meta) must require administrator-level capability — it is not per-page content.
+     */
+    public function check_admin_permission(): bool {
+        return current_user_can('manage_options');
     }
 
     /**
      * Convert a WP_Error (carrying an optional HTTP status in its data) into a
      * uniform REST response: {"error": "<message>", "code": "<code>"}.
      */
+    /**
+     * Reject an oversized raw request body up front. Returns a 413 response to send,
+     * or null when the body is within limits.
+     */
+    private function reject_if_oversized(\WP_REST_Request $request): ?\WP_REST_Response {
+        $check = Validator::check_body_size((string) $request->get_body());
+        return is_wp_error($check) ? $this->error_response($check) : null;
+    }
+
     private function error_response(\WP_Error $error): \WP_REST_Response {
         $data   = $error->get_error_data();
         $status = is_array($data) && isset($data['status']) ? (int) $data['status'] : 400;
@@ -241,6 +275,10 @@ class REST_Controller {
 
         $result = [];
         foreach ($pages as $page) {
+            // Do not leak drafts/pending pages to a caller who cannot edit them.
+            if ($page->post_status !== 'publish' && !current_user_can('edit_post', $page->ID)) {
+                continue;
+            }
             $has_elementor = get_post_meta($page->ID, '_elementor_edit_mode', true) === 'builder';
             $result[] = [
                 'id'            => $page->ID,
@@ -287,6 +325,7 @@ class REST_Controller {
     }
 
     public function update_page(\WP_REST_Request $request): \WP_REST_Response {
+        if ($r = $this->reject_if_oversized($request)) return $r;
         $id   = (int) $request['id'];
         $body = $request->get_json_params();
 
@@ -309,6 +348,7 @@ class REST_Controller {
     }
 
     public function create_page(\WP_REST_Request $request): \WP_REST_Response {
+        if ($r = $this->reject_if_oversized($request)) return $r;
         $body = $request->get_json_params();
         $title = $body['title'] ?? 'New Page';
         $slug  = $body['slug'] ?? sanitize_title($title);
@@ -371,6 +411,7 @@ class REST_Controller {
     }
 
     public function add_element(\WP_REST_Request $request): \WP_REST_Response {
+        if ($r = $this->reject_if_oversized($request)) return $r;
         $page_id = (int) $request['id'];
         $body    = $request->get_json_params();
         $data    = Elementor_Data::get_page_data($page_id);
@@ -538,6 +579,7 @@ class REST_Controller {
      * Patches are applied sequentially in the given order.
      */
     public function patch_elements_bulk(\WP_REST_Request $request): \WP_REST_Response {
+        if ($r = $this->reject_if_oversized($request)) return $r;
         $page_id = (int) $request['id'];
         $body    = $request->get_json_params();
         $patches = $body['patches'] ?? [];
@@ -742,11 +784,19 @@ class REST_Controller {
     }
 
     public function create_template(\WP_REST_Request $request): \WP_REST_Response {
+        if ($r = $this->reject_if_oversized($request)) return $r;
         $body       = $request->get_json_params();
         $title      = $body['title'] ?? 'Template';
         $type       = $body['type'] ?? 'section';
         $data       = $body['data'] ?? [];
         $conditions = $body['conditions'] ?? ['include/general'];
+
+        if (!empty($data) && is_array($data)) {
+            $valid = Validator::validate_tree($data);
+            if (is_wp_error($valid)) {
+                return $this->error_response($valid);
+            }
+        }
 
         $post_id = Elementor_Data::create_template($title, $type, $data, $conditions);
 
@@ -768,6 +818,7 @@ class REST_Controller {
     }
 
     public function update_kit(\WP_REST_Request $request): \WP_REST_Response {
+        if ($r = $this->reject_if_oversized($request)) return $r;
         $body    = $request->get_json_params();
         $success = Elementor_Data::update_kit_settings($body);
         return new \WP_REST_Response(['success' => $success], $success ? 200 : 500);
@@ -808,8 +859,10 @@ class REST_Controller {
     // ── Media ────────────────────────────────────────────────
 
     public function import_media(\WP_REST_Request $request): \WP_REST_Response {
+        if ($r = $this->reject_if_oversized($request)) return $r;
         $body  = $request->get_json_params();
-        $path  = $body['path'] ?? '';
+        // Accept `source_path` (canonical, matches MCP) and legacy `path`.
+        $path  = $body['source_path'] ?? ($body['path'] ?? '');
         $title = $body['title'] ?? '';
 
         // Resolve + validate the path: must be a real image inside the uploads dir.
@@ -849,6 +902,7 @@ class REST_Controller {
     // ── Build Page (composite) ───────────────────────────────
 
     public function build_page(\WP_REST_Request $request): \WP_REST_Response {
+        if ($r = $this->reject_if_oversized($request)) return $r;
         $body = $request->get_json_params();
 
         // Validate the element tree up front (if provided) — fail before creating a page.
@@ -871,13 +925,24 @@ class REST_Controller {
             if (is_wp_error($page_id)) {
                 return new \WP_REST_Response(['error' => $page_id->get_error_message()], 500);
             }
+        } else {
+            // Updating an existing page — the route has no {id}, so the generic
+            // permission_callback (edit_pages) ran; enforce per-post edit here.
+            if (!current_user_can('edit_post', (int) $page_id)) {
+                return $this->error_response(
+                    new \WP_Error('forbidden', 'You do not have permission to edit this page.', ['status' => 403])
+                );
+            }
         }
 
         // Import images if provided (each path validated against traversal/LFI).
+        // Accept both `source_path` (canonical, matches the MCP ability) and the
+        // legacy `path` key so neither surface silently imports nothing.
         $media_map = [];
         if (!empty($body['images']) && is_array($body['images'])) {
             foreach ($body['images'] as $key => $img) {
-                $resolved = Validator::resolve_media_path((string) ($img['path'] ?? ''));
+                $src = $img['source_path'] ?? ($img['path'] ?? '');
+                $resolved = Validator::resolve_media_path((string) $src);
                 if (is_wp_error($resolved)) {
                     $media_map[$key] = ['id' => 0, 'url' => '', 'error' => $resolved->get_error_message()];
                     continue;
