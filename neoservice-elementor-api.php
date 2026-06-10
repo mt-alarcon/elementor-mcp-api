@@ -2,7 +2,7 @@
 /**
  * Plugin Name: NeoService Elementor API
  * Description: REST API + MCP tools for AI-driven Elementor page building. Exposes endpoints to create, read, update pages, elements, templates, and global settings programmatically. Compatible with WordPress MCP Adapter.
- * Version: 1.4.1
+ * Version: 1.4.4
  * Author: NeoService
  * Requires at least: 6.0
  * Requires PHP: 7.4
@@ -20,7 +20,7 @@ if (!function_exists('str_starts_with')) {
     }
 }
 
-define('NEOSERVICE_ELEMENTOR_API_VERSION', '1.4.1');
+define('NEOSERVICE_ELEMENTOR_API_VERSION', '1.4.4');
 define('NEOSERVICE_ELEMENTOR_API_PATH', plugin_dir_path(__FILE__));
 
 // Load core includes

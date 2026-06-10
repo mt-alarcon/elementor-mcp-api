@@ -141,6 +141,28 @@ generic security bugs in the upstream `bvisible/elementor-mcp-api` and should be
 
 ---
 
+## 3c. v1.4.2 — second security-audit pass (@vault)
+
+Three additive fixes, each shipped with a reproducing test (suite 46 → 88 assertions);
+no endpoint/ability signature changed:
+
+1. **`unfiltered_html` gate was dead code → stored-XSS (HIGH).** Gate lived only on the
+   direct-meta fallback of `save_page_data`, never reached in production (native path wins).
+   Moved to the top of `save_page_data` for all paths: non-privileged callers get
+   HTML-carrying settings sanitized recursively via `wp_kses_post`
+   (`Elementor_Data::kses_widget_html`, keys: `editor`, `html`, `title`, `text`, `content`,
+   `description`, `caption`, `title_text`, `description_text`, `testimonial_content`,
+   incl. repeater items); `unfiltered_html` callers untouched.
+2. **`add_section` bypassed `validate_tree` + body ceiling (MEDIUM)** — now validates the
+   section subtree and rejects oversized bodies like every other write.
+3. **4MB ceiling uniform (MEDIUM, DoS)** — REST guard added to `update_element`,
+   `move_element`, `set_column_width`; MCP surface gets `guard_input_size()` (same
+   `Validator::MAX_BODY_BYTES`, JSON-encoded input) at the top of all 13 write abilities.
+
+**Upstream-PR candidates:** all three are generic upstream bugs.
+
+---
+
 ## 4. What needs a live WordPress + Elementor to validate (post-install)
 
 The static layer (lint + pure-logic unit tests) is green, but these runtime paths cannot be

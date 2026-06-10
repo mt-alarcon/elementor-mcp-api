@@ -40,12 +40,19 @@ class Asserter {
 require __DIR__ . '/wp-stubs.php';
 require __DIR__ . '/../includes/class-validator.php';
 require __DIR__ . '/../includes/class-element-factory.php';
+require __DIR__ . '/../includes/class-elementor-data.php';
+require __DIR__ . '/../includes/class-rest-controller.php';
+require __DIR__ . '/../includes/class-abilities-provider.php';
 
 $t = new Asserter();
 
 $suites = [
-    'Validator'       => __DIR__ . '/test-validator.php',
-    'Element_Factory' => __DIR__ . '/test-element-factory.php',
+    'Validator'          => __DIR__ . '/test-validator.php',
+    'Element_Factory'    => __DIR__ . '/test-element-factory.php',
+    'REST_Security'      => __DIR__ . '/test-rest-security.php',
+    'Abilities_Security' => __DIR__ . '/test-abilities-security.php',
+    'Kses_Gate'          => __DIR__ . '/test-kses-gate.php',
+    'Template_Safety'    => __DIR__ . '/test-template-safety.php',
 ];
 
 foreach ($suites as $name => $file) {

@@ -44,6 +44,18 @@ class Elementor_Data {
      * @return bool Success.
      */
     public static function save_page_data(int $post_id, array $data): bool {
+        // Stored-XSS gate — applies to EVERY save path, including the native Elementor
+        // one. Element JSON can carry raw HTML/scripts via widget settings (text-editor's
+        // `editor`, the HTML widget's `html`, etc.). Previously this gate only existed on
+        // the direct-meta fallback below, which never runs in production (Elementor active
+        // → native path wins), so a caller WITHOUT `unfiltered_html` could persist
+        // `<script>` to visitors. Now: callers lacking `unfiltered_html` (administrators
+        // have it) get their HTML-carrying settings sanitized with wp_kses_post; callers
+        // with the capability keep their content intact.
+        if (function_exists('current_user_can') && !current_user_can('unfiltered_html')) {
+            $data = self::kses_widget_html($data);
+        }
+
         // Snapshot the current state for rollback (best-effort, never blocks the save).
         $previous = get_post_meta($post_id, '_elementor_data', true);
         if (!empty($previous)) {
@@ -64,16 +76,10 @@ class Elementor_Data {
             }
         }
 
-        // Fallback: direct meta write. This path bypasses Elementor's own save
-        // pipeline, so the element JSON (which can contain inline HTML/scripts via
-        // widgets like text-editor or HTML) lands in post meta unsanitized. Gate it
-        // on the `unfiltered_html` capability — administrators have it; lower roles
-        // (e.g. Author) do not, which blocks stored-XSS injection through this route.
-        // When Elementor is active the native path above runs and this is never reached.
-        if (function_exists('current_user_can') && !current_user_can('unfiltered_html')) {
-            return false;
-        }
-
+        // Fallback: direct meta write. Stored-XSS is already neutralized by the
+        // unconditional `unfiltered_html` kses gate at the top of this method (which
+        // replaced the old fallback-only hard block — that block was dead code in
+        // production because the native path above always wins when Elementor is active).
         $json = wp_slash(wp_json_encode($data));
         update_post_meta($post_id, '_elementor_data', $json);
         update_post_meta($post_id, '_elementor_version', ELEMENTOR_VERSION ?? '3.35.7');
@@ -82,6 +88,66 @@ class Elementor_Data {
         self::flush_css($post_id);
 
         return true;
+    }
+
+    /**
+     * Settings keys that carry caller-supplied HTML rendered to visitors.
+     *
+     * Derived from the widgets Element_Factory emits plus the common Elementor core
+     * widgets: text-editor (`editor`), HTML widget (`html`), heading (`title`),
+     * button (`text`), icon-box/image-box (`title_text`, `description_text`,
+     * `description`), image (`caption`), testimonial (`testimonial_content`),
+     * generic rich-text (`content`), tabs/accordion/toggle (`tab_content`),
+     * alert (`alert_title`, `alert_description`), Pro widgets (`inner_text`).
+     * Plain text in these keys passes through
+     * wp_kses_post unchanged; scripts/event handlers are stripped.
+     */
+    const HTML_SETTING_KEYS = [
+        'editor', 'html', 'title', 'text', 'content', 'description', 'caption',
+        'title_text', 'description_text', 'testimonial_content',
+        'tab_content', 'alert_title', 'alert_description', 'inner_text',
+    ];
+
+    /**
+     * Recursively sanitize the HTML-carrying settings of an element tree with
+     * wp_kses_post. Used by {@see save_page_data} when the caller lacks the
+     * `unfiltered_html` capability, so a non-admin cannot persist `<script>` or
+     * event-handler attributes into `_elementor_data` (stored XSS to visitors).
+     *
+     * Walks `settings` (including repeater item arrays, e.g. icon lists or
+     * testimonials, which nest settings-shaped arrays) and child `elements`.
+     *
+     * @param array $elements Element tree (or subtree) as stored in `_elementor_data`.
+     * @return array Sanitized tree.
+     */
+    public static function kses_widget_html(array $elements): array {
+        foreach ($elements as &$el) {
+            if (!is_array($el)) continue;
+            if (!empty($el['settings']) && is_array($el['settings'])) {
+                $el['settings'] = self::kses_settings($el['settings']);
+            }
+            if (!empty($el['elements']) && is_array($el['elements'])) {
+                $el['elements'] = self::kses_widget_html($el['elements']);
+            }
+        }
+        unset($el);
+        return $elements;
+    }
+
+    /**
+     * Worker for {@see kses_widget_html}: kses string values under HTML-carrying
+     * keys; recurse into nested arrays (repeater items carry their own settings).
+     */
+    private static function kses_settings(array $settings): array {
+        foreach ($settings as $key => &$value) {
+            if (is_string($value) && in_array((string) $key, self::HTML_SETTING_KEYS, true)) {
+                $value = wp_kses_post($value);
+            } elseif (is_array($value)) {
+                $value = self::kses_settings($value);
+            }
+        }
+        unset($value);
+        return $settings;
     }
 
     /**
@@ -225,12 +291,16 @@ class Elementor_Data {
 
     /**
      * Create an Elementor Theme Builder template (header, footer, etc).
+     *
+     * Defaults to 'draft' (defense in depth): a published header/footer with the
+     * default ['include/general'] conditions goes LIVE site-wide the moment it is
+     * created. Publishing must be an explicit caller decision ($status = 'publish').
      */
-    public static function create_template(string $title, string $type, array $data, array $conditions = ['include/general']): int {
+    public static function create_template(string $title, string $type, array $data, array $conditions = ['include/general'], string $status = 'draft'): int {
         $post_id = wp_insert_post([
             'post_title'  => $title,
             'post_type'   => 'elementor_library',
-            'post_status' => 'publish',
+            'post_status' => in_array($status, ['draft', 'publish'], true) ? $status : 'draft',
         ]);
 
         if (is_wp_error($post_id)) return 0;
@@ -251,6 +321,38 @@ class Elementor_Data {
         update_option('elementor_pro_theme_builder_conditions', $all_conditions);
 
         return $post_id;
+    }
+
+    /**
+     * Delete an Elementor Theme Builder template (rollback path for create_template).
+     *
+     * Default = trash (restorable in WP admin). $force = permanent delete, which also
+     * unregisters the template from the Elementor Pro theme-builder conditions map so
+     * no orphaned condition entry remains. Returns false when the post does not exist
+     * or is not an elementor_library template (never touches other post types).
+     */
+    public static function delete_template(int $post_id, bool $force = false): bool {
+        $post = get_post($post_id);
+        if (!$post || $post->post_type !== 'elementor_library') {
+            return false;
+        }
+
+        if (!$force) {
+            return (bool) wp_trash_post($post_id);
+        }
+
+        // Permanent delete: clean the conditions registry first.
+        $all_conditions = get_option('elementor_pro_theme_builder_conditions', []);
+        if (is_array($all_conditions)) {
+            foreach ($all_conditions as $type => $entries) {
+                if (is_array($entries) && array_key_exists($post_id, $entries)) {
+                    unset($all_conditions[$type][$post_id]);
+                }
+            }
+            update_option('elementor_pro_theme_builder_conditions', $all_conditions);
+        }
+
+        return (bool) wp_delete_post($post_id, true);
     }
 
     // ── Kit / Global Settings ────────────────────────────────

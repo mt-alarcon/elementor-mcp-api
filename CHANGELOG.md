@@ -3,6 +3,79 @@
 All notable changes to this fork of [bvisible/elementor-mcp-api](https://github.com/bvisible/elementor-mcp-api) are documented here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/); versions are the plugin header version.
 
+## [1.4.4] — 2026-06-10
+
+Template-safety hardening (gap found in the orphan-command review). A theme-builder
+template created via `POST /template` used to go in as `publish` with default conditions
+`["include/general"]` — i.e. a `header`/`footer` went LIVE site-wide at creation time.
+
+### Security
+- **`create_template` defaults to `draft` (REST + MCP ability + data layer).** Publishing
+  now requires an explicit `status: "publish"` in the body/input; any other value is
+  rejected (REST: 400, ability: `WP_Error invalid_status`). `Elementor_Data::create_template`
+  gained an optional `$status = 'draft'` parameter and clamps unknown values to `draft`
+  (defense in depth — the raw endpoint can no longer publish by omission).
+
+### Added
+- **`DELETE /template/{id}`** (admin-only, `manage_options`) — rollback path for
+  `create_template`. Trash by default (restorable); `?force=true` is permanent and also
+  unregisters the template from the `elementor_pro_theme_builder_conditions` map (no
+  orphaned condition entries). 404 when the post is missing or is not an
+  `elementor_library` post — never touches other post types.
+- `create_template` REST response now echoes the effective `status` (additive).
+
+### Tests
+- New suite `tests/test-template-safety.php` reproducing each gap before the fix:
+  draft default, explicit publish, invalid status rejection (REST + ability),
+  delete-template trash/permanent/404/wrong-post-type, conditions-map cleanup.
+  Stubs gained recording `wp_insert_post` and `get_post`/`wp_trash_post`/`wp_delete_post`.
+
+## [1.4.3] — 2026-06-10
+
+Micro-fix closing the residual LOW finding from the 2026-06-10 @vault re-audit. Additive
+allowlist change only; no walk logic or endpoint signature touched.
+
+### Security
+- **kses allowlist amplified (LOW).** `Elementor_Data::HTML_SETTING_KEYS` agora cobre
+  `tab_content` (tabs/accordion/toggle core), `alert_title`/`alert_description` (alert)
+  e `inner_text` (widgets Pro) — keys que carregam HTML e ficavam fora da sanitização
+  `wp_kses_post` quando o caller não tem `unfiltered_html` (vetor de stored-XSS).
+  Testes novos em `tests/test-kses-gate.php` cobrem `tab_content` (via repeater `tabs`)
+  e `alert_description`, nos dois sentidos (strip sem capability, byte-idêntico com).
+
+## [1.4.2] — 2026-06-10
+
+Second security-audit pass (@vault). Three server-side hardening fixes — all additive
+(validation/sanitization only); no endpoint or ability signature changed.
+
+### Security
+- **Stored-XSS via dead `unfiltered_html` gate — fixed (HIGH).** The capability gate in
+  `Elementor_Data::save_page_data()` only existed on the direct-meta fallback, which never
+  runs in production (Elementor active → native save path wins), so a caller WITHOUT
+  `unfiltered_html` could persist `<script>`/event-handler HTML to visitors. The gate now
+  runs at the top of `save_page_data()` for EVERY path: non-privileged callers get
+  HTML-carrying settings (`editor`, `html`, `title`, `text`, repeater items, etc.)
+  sanitized recursively with `wp_kses_post` (new `kses_widget_html()` helper); callers
+  with `unfiltered_html` keep content byte-identical. The old fallback-only hard block
+  was removed in favor of the sanitize-always gate.
+- **`add_section` skipped validation and the body ceiling — fixed (MEDIUM).** The REST
+  `add_section` handler was the only write that called neither `Validator::validate_tree()`
+  nor the 4MB raw-body guard. It now runs both before inserting, same contract as
+  `add_element` (depth/element-count ceilings, elType allowlist, 413 on oversized body).
+- **4MB ceiling now uniform across both surfaces (MEDIUM, DoS).** REST: added the missing
+  `reject_if_oversized` guard to `update_element`, `move_element` and `set_column_width`.
+  MCP: new `Abilities_Provider::guard_input_size()` applies the same
+  `Validator::MAX_BODY_BYTES` ceiling to the JSON-encoded ability input at the top of all
+  13 write abilities (the MCP surface has no raw HTTP body, so the REST guard never covered it).
+
+### Tests
+- Suite grows 46 → 88 assertions. Three new suites: `test-rest-security.php` (add_section
+  ceilings + the 3 previously-unguarded REST writes), `test-abilities-security.php`
+  (iterates ALL 13 write abilities against an oversized input), `test-kses-gate.php`
+  (script stripped without `unfiltered_html`, content intact with it). `wp-stubs.php`
+  extended with REST request/response doubles, capability/meta/option stores and an
+  ability-registry collector.
+
 ## [1.4.1] — 2026-06-09
 
 Independent security-audit follow-up, applied **before any production install**.

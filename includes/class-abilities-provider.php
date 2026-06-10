@@ -88,6 +88,28 @@ class Abilities_Provider {
     }
 
     /**
+     * Input-size ceiling for write abilities (DoS guard). The REST surface rejects
+     * oversized raw bodies via Validator::check_body_size() before JSON-decoding;
+     * the MCP surface receives an already-decoded input array, so apply the same
+     * MAX_BODY_BYTES ceiling to its JSON-encoded size. Call at the top of every
+     * write ability's execute_callback.
+     *
+     * @param mixed $input The ability input.
+     * @return \WP_Error|null WP_Error (413) when oversized, null to proceed.
+     */
+    public static function guard_input_size($input): ?\WP_Error {
+        $encoded = wp_json_encode($input);
+        if (is_string($encoded) && strlen($encoded) > Validator::MAX_BODY_BYTES) {
+            return new \WP_Error(
+                'payload_too_large',
+                sprintf('Ability input exceeds the %d-byte limit.', Validator::MAX_BODY_BYTES),
+                ['status' => 413]
+            );
+        }
+        return null;
+    }
+
+    /**
      * Register the ability category and all abilities.
      */
     public static function register_category(): void {
@@ -262,6 +284,7 @@ class Abilities_Provider {
                 ],
             ],
             'execute_callback' => function ($input) {
+                if ($e = self::guard_input_size($input)) return $e;
                 $post_id = (int) $input['post_id'];
                 if ($e = self::guard_edit_post($post_id)) return $e;
                 if (!is_array($input['data'])) {
@@ -313,6 +336,7 @@ class Abilities_Provider {
                 ],
             ],
             'execute_callback' => function ($input) {
+                if ($e = self::guard_input_size($input)) return $e;
                 $post_id = wp_insert_post([
                     'post_title'  => sanitize_text_field($input['title']),
                     'post_name'   => sanitize_title($input['slug'] ?? $input['title']),
@@ -413,6 +437,7 @@ class Abilities_Provider {
                 ],
             ],
             'execute_callback' => function ($input) {
+                if ($e = self::guard_input_size($input)) return $e;
                 $post_id = (int) $input['post_id'];
                 if ($e = self::guard_edit_post($post_id)) return $e;
                 $data    = Elementor_Data::get_page_data($post_id);
@@ -474,6 +499,7 @@ class Abilities_Provider {
                 ],
             ],
             'execute_callback' => function ($input) {
+                if ($e = self::guard_input_size($input)) return $e;
                 $post_id = (int) $input['post_id'];
                 if ($e = self::guard_edit_post($post_id)) return $e;
                 $data    = Elementor_Data::get_page_data($post_id);
@@ -525,6 +551,7 @@ class Abilities_Provider {
                 ],
             ],
             'execute_callback' => function ($input) {
+                if ($e = self::guard_input_size($input)) return $e;
                 $post_id = (int) $input['post_id'];
                 if ($e = self::guard_edit_post($post_id)) return $e;
                 $data    = Elementor_Data::get_page_data($post_id);
@@ -587,6 +614,7 @@ class Abilities_Provider {
                 ],
             ],
             'execute_callback' => function ($input) {
+                if ($e = self::guard_input_size($input)) return $e;
                 $post_id = (int) $input['post_id'];
                 if ($e = self::guard_edit_post($post_id)) return $e;
                 $data    = Elementor_Data::get_page_data($post_id);
@@ -629,6 +657,7 @@ class Abilities_Provider {
                 ],
             ],
             'execute_callback' => function ($input) {
+                if ($e = self::guard_input_size($input)) return $e;
                 $post_id = (int) $input['post_id'];
                 if ($e = self::guard_edit_post($post_id)) return $e;
                 $data    = Elementor_Data::get_page_data($post_id);
@@ -829,6 +858,7 @@ class Abilities_Provider {
             ],
             'output_schema' => ['type' => 'object'],
             'execute_callback' => function ($input) {
+                if ($e = self::guard_input_size($input)) return $e;
                 $post_id = (int) $input['post_id'];
                 if ($e = self::guard_edit_post($post_id)) return $e;
                 $patches = $input['patches'] ?? [];
@@ -871,6 +901,7 @@ class Abilities_Provider {
             ],
             'output_schema' => ['type' => 'object'],
             'execute_callback' => function ($input) {
+                if ($e = self::guard_input_size($input)) return $e;
                 $post_id = (int) $input['post_id'];
                 if ($e = self::guard_edit_post($post_id)) return $e;
                 $ok = Elementor_Data::restore_backup($post_id);
@@ -949,6 +980,11 @@ class Abilities_Provider {
                         'description' => 'Display conditions. Default: ["include/general"] (entire site).',
                         'items'       => ['type' => 'string'],
                     ],
+                    'status' => [
+                        'type'        => 'string',
+                        'description' => 'Post status. Default: draft (safe). "publish" activates the conditions immediately — a header/footer with include/general goes live site-wide.',
+                        'enum'        => ['draft', 'publish'],
+                    ],
                 ],
                 'additionalProperties' => false,
             ],
@@ -959,17 +995,23 @@ class Abilities_Provider {
                 ],
             ],
             'execute_callback' => function ($input) {
+                if ($e = self::guard_input_size($input)) return $e;
                 if ($e = self::guard_admin()) return $e;
                 if (!empty($input['data']) && is_array($input['data'])) {
                     $valid = Validator::validate_tree($input['data']);
                     if (is_wp_error($valid)) return $valid;
                 }
                 $conditions = $input['conditions'] ?? ['include/general'];
+                $status = $input['status'] ?? 'draft';
+                if (!in_array($status, ['draft', 'publish'], true)) {
+                    return new \WP_Error('invalid_status', "Invalid status '{$status}' — allowed: draft, publish.");
+                }
                 $post_id = Elementor_Data::create_template(
                     sanitize_text_field($input['title']),
                     $input['type'],
                     $input['data'],
-                    $conditions
+                    $conditions,
+                    $status
                 );
                 if (!$post_id) return new \WP_Error('failed', 'Failed to create template.');
                 return ['post_id' => $post_id];
@@ -1019,6 +1061,7 @@ class Abilities_Provider {
                 ],
             ],
             'execute_callback' => function ($input) {
+                if ($e = self::guard_input_size($input)) return $e;
                 if ($e = self::guard_admin()) return $e;
                 $ok = Elementor_Data::update_kit_settings($input['settings']);
                 if (!$ok) return new \WP_Error('failed', 'Kit not found or update failed.');
@@ -1121,6 +1164,7 @@ class Abilities_Provider {
                 ],
             ],
             'execute_callback' => function ($input = []) {
+                if ($e = self::guard_input_size($input)) return $e;
                 $post_id = (int) ($input['post_id'] ?? 0);
                 if ($post_id) {
                     Elementor_Data::flush_css($post_id);
@@ -1180,6 +1224,7 @@ class Abilities_Provider {
                 ],
             ],
             'execute_callback' => function ($input) {
+                if ($e = self::guard_input_size($input)) return $e;
                 // If targeting an existing page, enforce per-post edit permission
                 // (the permission_callback only covers the create case via edit_pages).
                 if (!empty($input['post_id'])) {

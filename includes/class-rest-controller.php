@@ -138,6 +138,14 @@ class REST_Controller {
             ...$admin,
         ]);
 
+        // Rollback path for create_template. Trash by default; ?force=true is
+        // permanent (also unregisters theme-builder conditions). Admin only.
+        register_rest_route(self::NAMESPACE, '/template/(?P<id>\d+)', [
+            'methods'  => 'DELETE',
+            'callback' => [$this, 'delete_template'],
+            ...$admin,
+        ]);
+
         // ── Kit / Global Settings ────────────────────────
         register_rest_route(self::NAMESPACE, '/kit', [
             'methods'  => 'GET',
@@ -212,7 +220,7 @@ class REST_Controller {
 
     // ── Permission checks ────────────────────────────────────
 
-    public function check_read_permission(\WP_REST_Request $request = null): bool {
+    public function check_read_permission(?\WP_REST_Request $request = null): bool {
         // Per-post read check when an id is present (so drafts the caller can't
         // read are not exposed); generic read otherwise.
         if ($request && isset($request['id'])) {
@@ -221,7 +229,7 @@ class REST_Controller {
         return current_user_can('read');
     }
 
-    public function check_edit_permission(\WP_REST_Request $request = null): bool {
+    public function check_edit_permission(?\WP_REST_Request $request = null): bool {
         // Per-post edit check when an id is present (maps to edit_page on the
         // 'page' post type), so an Author cannot rewrite another user's page.
         // For create routes (no id) require edit_pages — the broad edit_posts
@@ -461,6 +469,7 @@ class REST_Controller {
     }
 
     public function update_element(\WP_REST_Request $request): \WP_REST_Response {
+        if ($r = $this->reject_if_oversized($request)) return $r;
         $page_id    = (int) $request['id'];
         $element_id = $request['element_id'];
         $body       = $request->get_json_params();
@@ -524,6 +533,7 @@ class REST_Controller {
     }
 
     public function move_element(\WP_REST_Request $request): \WP_REST_Response {
+        if ($r = $this->reject_if_oversized($request)) return $r;
         $page_id    = (int) $request['id'];
         $element_id = $request['element_id'];
         $body       = $request->get_json_params();
@@ -634,6 +644,7 @@ class REST_Controller {
      * Body: {"percent": 25, "tablet": 50, "mobile": 100}
      */
     public function set_column_width(\WP_REST_Request $request): \WP_REST_Response {
+        if ($r = $this->reject_if_oversized($request)) return $r;
         $page_id    = (int) $request['id'];
         $element_id = $request['element_id'];
         $body       = $request->get_json_params();
@@ -737,6 +748,7 @@ class REST_Controller {
     // ── Sections ─────────────────────────────────────────────
 
     public function add_section(\WP_REST_Request $request): \WP_REST_Response {
+        if ($r = $this->reject_if_oversized($request)) return $r;
         $page_id  = (int) $request['id'];
         $body     = $request->get_json_params();
         $data     = Elementor_Data::get_page_data($page_id) ?? [];
@@ -745,6 +757,13 @@ class REST_Controller {
 
         if (!$section || !is_array($section)) {
             return new \WP_REST_Response(['error' => 'Missing "section" object'], 400);
+        }
+
+        // Validate the section subtree before insertion — same container contract
+        // as add_element (depth/element-count ceilings, elType allowlist).
+        $valid = Validator::validate_tree([$section]);
+        if (is_wp_error($valid)) {
+            return $this->error_response($valid);
         }
 
         if (empty($section['id'])) {
@@ -791,6 +810,15 @@ class REST_Controller {
         $data       = $body['data'] ?? [];
         $conditions = $body['conditions'] ?? ['include/general'];
 
+        // Footgun guard: templates are created as DRAFT unless the caller asks for
+        // publish explicitly — a published header/footer with include/general goes
+        // live site-wide at creation time.
+        $status = $body['status'] ?? 'draft';
+        if (!in_array($status, ['draft', 'publish'], true)) {
+            return new \WP_REST_Response(
+                ['error' => "Invalid status '{$status}' — allowed: draft, publish"], 400);
+        }
+
         if (!empty($data) && is_array($data)) {
             $valid = Validator::validate_tree($data);
             if (is_wp_error($valid)) {
@@ -798,17 +826,35 @@ class REST_Controller {
             }
         }
 
-        $post_id = Elementor_Data::create_template($title, $type, $data, $conditions);
+        $post_id = Elementor_Data::create_template($title, $type, $data, $conditions, $status);
 
         if (!$post_id) {
             return new \WP_REST_Response(['error' => 'Failed to create template'], 500);
         }
 
         return new \WP_REST_Response([
-            'id'    => $post_id,
-            'title' => $title,
-            'type'  => $type,
+            'id'     => $post_id,
+            'title'  => $title,
+            'type'   => $type,
+            'status' => $status,
         ], 201);
+    }
+
+    public function delete_template(\WP_REST_Request $request): \WP_REST_Response {
+        $post_id = (int) $request['id'];
+        $force   = filter_var($request->get_param('force'), FILTER_VALIDATE_BOOLEAN);
+
+        $ok = Elementor_Data::delete_template($post_id, $force);
+        if (!$ok) {
+            return new \WP_REST_Response(
+                ['error' => 'Template not found (or not an elementor_library post)'], 404);
+        }
+
+        return new \WP_REST_Response([
+            'id'      => $post_id,
+            'deleted' => true,
+            'mode'    => $force ? 'permanent' : 'trash',
+        ], 200);
     }
 
     // ── Kit ──────────────────────────────────────────────────
